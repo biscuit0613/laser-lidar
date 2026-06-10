@@ -2,67 +2,72 @@
 """
 MCP (Model Context Protocol) 服务器 — 作物株高分析服务
 
-为 LLM (大语言模型) 提供点云分析工具，支持：
-  - 单文件株高分析
-  - 多文件批量对比
-  - CHM 导出为 GeoTIFF
-  - LAS 文件元数据查询
+FarmOS 调度中枢通过 Streamable HTTP 协议对接本服务。
+LLM 通过 MCP 工具调用实现点云分析与株高测量。
 
 启动方式:
-  1. stdio 模式 (调试):
-     laser-lidar-mcp --transport stdio
+  生产部署:
+    uvicorn crop_height.mcp_server:app --host 0.0.0.0 --port 8000
 
-  2. SSE 模式 (生产部署):
-     laser-lidar-mcp --host 0.0.0.0 --port 8080
+  本地调试 (备用):
+    python -m crop_height.mcp_server --port 8000
 
-环境变量:
-  HOST: 监听地址 (默认 0.0.0.0)
-  PORT: 监听端口 (默认 8080)
+Inspector 调试:
+  npx @modelcontextprotocol/inspector
+  → Transport: Streamable HTTP
+  → URL: http://localhost:8000/mcp
 """
 
-import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Annotated
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from .pipeline import CropHeightAnalyzer
-from .las_reader import get_las_info
+from .las_reader import get_las_info as get_las_file_info
 
 # ── MCP 服务器实例 ─────────────────────────────────────────────
 mcp = FastMCP(
     "laser-lidar",
     instructions=(
-        "Agricultural LiDAR crop height analysis service. "
-        "Process LAS point cloud files to determine crop/plant height. "
-        "Requires files with ASPRS Classification: Class 2 = Ground, Class 1 = Vegetation."
+        "Agricultural LiDAR crop/plant height analysis service. "
+        "Process LAS point cloud files to determine crop height. "
+        "Files must contain ASPRS Classification: Class 2 (Ground) and Class 1 (Vegetation)."
     ),
 )
+
+
+# ── 健康检查 ──────────────────────────────────────────────────
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "service": "laser-lidar mcp"})
 
 
 # ── Tool: 获取 LAS 文件信息 ────────────────────────────────────
 @mcp.tool(
-    name="get_las_info",
     description=(
-        "Get metadata and classification summary of a LAS point cloud file. "
-        "Returns point count, coordinate bounds, CRS, classification distribution, "
-        "and available fields. Does NOT perform full height analysis."
+        "获取 LAS 点云文件的元数据信息。返回点总数、坐标范围、坐标系、"
+        "各分类别点数、是否包含RGB字段等。不执行株高分析，仅预览文件结构。"
     ),
 )
-async def get_las_info_tool(file_path: str) -> dict:
+async def get_las_info(
+    file_path: Annotated[str, "LAS 点云文件的绝对路径或相对于工作目录的路径"],
+) -> dict:
     """
     获取 LAS 文件的基础元数据信息。
-
-    Args:
-        file_path: 绝对路径或相对于工作目录的 LAS 文件路径
     """
     path = Path(file_path)
     if not path.exists():
-        return {"error": f"File not found: {file_path}"}
+        return {"error": f"文件不存在: {file_path}"}
 
     try:
-        info = get_las_info(str(path))
+        info = get_las_file_info(str(path))
         return {
             "file": info.path,
             "point_count": info.point_count,
@@ -73,44 +78,37 @@ async def get_las_info_tool(file_path: str) -> dict:
             "fields": info.fields,
         }
     except Exception as e:
-        return {"error": f"Failed to read LAS file: {e}"}
+        return {"error": f"读取 LAS 文件失败: {e}"}
 
 
 # ── Tool: 单文件株高分析 ──────────────────────────────────────
 @mcp.tool(
-    name="analyze_crop_height",
     description=(
-        "Analyze crop/plant height from a LAS point cloud file. "
-        "Processes ground vs vegetation points to compute the Canopy Height Model (CHM). "
-        "Returns height statistics (mean, median, P90, P95), quadrat-based spatial analysis, "
-        "and RGB vegetation indices if available. "
-        "Use this for detailed plot-level crop height assessment."
+        "对单个 LAS 点云文件执行作物株高分析。自动分离地面点 (Class 2) "
+        "与植被点 (Class 1)，构建冠层高度模型 (CHM)，返回株高统计指标 "
+        "(均值、中位数、P90、P95)、样方空间分布以及 RGB 植被指数。"
     ),
 )
-async def analyze_crop_height_tool(
-    file_path: str,
-    resolution: float = 0.25,
+async def analyze_crop_height(
+    file_path: Annotated[str, "LAS 点云文件的路径"],
+    resolution: Annotated[float, "分析网格分辨率，单位米，值越小精度越高但计算量越大。推荐 0.25"] = 0.25,
 ) -> dict:
     """
     对单个 LAS 文件执行作物株高分析。
-
-    Args:
-        file_path: LAS 点云文件路径
-        resolution: 分析网格分辨率，单位米 (默认 0.25，即每平方米 4 格)
     """
     path = Path(file_path)
     if not path.exists():
-        return {"error": f"File not found: {file_path}"}
+        return {"error": f"文件不存在: {file_path}"}
     if resolution <= 0:
-        return {"error": "Resolution must be positive"}
+        return {"error": "分辨率必须大于 0"}
 
     try:
         analyzer = CropHeightAnalyzer(str(path), resolution=resolution)
         analyzer.run()
     except Exception as e:
-        return {"error": f"Analysis failed: {e}"}
+        return {"error": f"分析失败: {e}"}
 
-    # 组装结果
+    # 组装基础结果
     result = {
         "file": str(path),
         "resolution": resolution,
@@ -119,7 +117,7 @@ async def analyze_crop_height_tool(
         "chm_statistics": analyzer.stats,
     }
 
-    # 样方分析 (0.5m × 0.5m 区块，如用户需要更详细可调参数)
+    # 样方分析 (0.5m × 0.5m 区块)
     quadrats = analyzer.quadrat(block_size=2)
     if quadrats:
         result["quadrat_analysis"] = {
@@ -143,33 +141,27 @@ async def analyze_crop_height_tool(
 
 # ── Tool: 多文件批量比较 ──────────────────────────────────────
 @mcp.tool(
-    name="batch_compare",
     description=(
-        "Compare crop height statistics across multiple LAS files. "
-        "Useful for comparing different field plots, treatments, or time points. "
-        "Returns a summary table of mean, median, P90, and P95 heights per file."
+        "批量比较多个 LAS 文件的株高统计结果。适用于对比不同地块、"
+        "不同处理或不同时相的作物长势。返回每个文件的均值、中位数、P90、P95 等对比表。"
     ),
 )
-async def batch_compare_tool(
-    file_paths: list[str],
-    resolution: float = 0.25,
+async def batch_compare(
+    file_paths: Annotated[list[str], "需要比较的 LAS 文件路径列表，至少传入一个路径"],
+    resolution: Annotated[float, "分析网格分辨率，单位米，默认 0.25"] = 0.25,
 ) -> dict:
     """
     批量比较多个 LAS 文件的株高统计结果。
-
-    Args:
-        file_paths: LAS 文件路径列表
-        resolution: 分析网格分辨率，单位米 (默认 0.25)
     """
     if not file_paths:
-        return {"error": "No file paths provided"}
+        return {"error": "未提供文件路径"}
 
     results = []
     errors = []
     for fp in file_paths:
         path = Path(fp)
         if not path.exists():
-            errors.append({"file": fp, "error": "File not found"})
+            errors.append({"file": fp, "error": "文件不存在"})
             continue
 
         try:
@@ -204,33 +196,26 @@ async def batch_compare_tool(
 
 # ── Tool: 导出 CHM 为 GeoTIFF ─────────────────────────────────
 @mcp.tool(
-    name="export_geotiff",
     description=(
-        "Export the Canopy Height Model (CHM) as a GeoTIFF raster file. "
-        "The output file can be opened in GIS software such as QGIS or ArcGIS. "
-        "Requires an absolute output_path."
+        "将分析生成的冠层高度模型 (CHM) 导出为 GeoTIFF 栅格文件。"
+        "输出文件可在 QGIS、ArcGIS 等 GIS 软件中打开。输出路径必须为绝对路径。"
     ),
 )
-async def export_geotiff_tool(
-    file_path: str,
-    output_path: str,
-    resolution: float = 0.25,
+async def export_geotiff(
+    file_path: Annotated[str, "输入的 LAS 点云文件路径"],
+    output_path: Annotated[str, "输出的 .tif 文件绝对路径"],
+    resolution: Annotated[float, "分析网格分辨率，单位米，默认 0.25"] = 0.25,
 ) -> dict:
     """
     将分析生成的 CHM 导出为 GeoTIFF 栅格文件。
-
-    Args:
-        file_path: 输入的 LAS 点云文件路径
-        output_path: 输出的 .tif 文件路径（必须为绝对路径）
-        resolution: 分析网格分辨率，单位米 (默认 0.25)
     """
     path = Path(file_path)
     if not path.exists():
-        return {"error": f"Input file not found: {file_path}"}
+        return {"error": f"输入文件不存在: {file_path}"}
 
     out = Path(output_path)
     if out.is_dir():
-        return {"error": f"Output path is a directory: {output_path}"}
+        return {"error": f"输出路径是一个目录: {output_path}"}
 
     try:
         analyzer = CropHeightAnalyzer(str(path), resolution=resolution)
@@ -244,59 +229,58 @@ async def export_geotiff_tool(
     except ImportError as e:
         return {"error": str(e)}
     except Exception as e:
-        return {"error": f"Export failed: {e}"}
+        return {"error": f"导出失败: {e}"}
 
 
-# ── 服务器入口 ─────────────────────────────────────────────────
+# ── CORS 中间件 ───────────────────────────────────────────────
+# 开发调试阶段开启，生产环境如需限制来源请修改 allow_origins
+middleware = [
+    Middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "mcp-protocol-version",
+            "mcp-session-id",
+            "Authorization",
+            "Content-Type",
+        ],
+        expose_headers=["mcp-session-id"],
+    )
+]
+
+# ── ASGI 应用 (供 uvicorn 直接加载) ───────────────────────────
+app = mcp.http_app(path="/mcp", middleware=middleware)
+
+
+# ── CLI 入口 (备用启动方式) ────────────────────────────────────
 def main():
-    """解析命令行参数并启动 MCP 服务器"""
+    """命令行启动入口"""
+    import argparse
+
     parser = argparse.ArgumentParser(
         description="laser-lidar MCP Server — 作物株高点云分析服务"
     )
     parser.add_argument(
         "--host", default=None,
-        help="监听地址 (默认: 0.0.0.0, 可从环境变量 HOST 读取)"
+        help="监听地址 (默认 0.0.0.0，可从环境变量 HOST 读取)"
     )
     parser.add_argument(
         "--port", type=int, default=None,
-        help="监听端口 (默认: 8080, 可从环境变量 PORT 读取)"
-    )
-    parser.add_argument(
-        "--transport", choices=["stdio", "sse"], default="sse",
-        help="传输方式: stdio (本地CLI) 或 sse (HTTP远程) [默认: sse]"
+        help="监听端口 (默认 8000，可从环境变量 PORT 读取)"
     )
     args = parser.parse_args()
 
-    # 从环境变量或命令行参数读取配置
     host = args.host or os.environ.get("HOST", "0.0.0.0")
-    port = args.port or int(os.environ.get("PORT", "8080"))
+    port = args.port or int(os.environ.get("PORT", "8000"))
 
-    if args.transport == "stdio":
-        print("Starting MCP server in stdio mode...", file=sys.stderr)
-        mcp.run(transport="stdio")
-    else:
-        print(f"Starting MCP server in SSE mode on {host}:{port}...", file=sys.stderr)
-        print(f"  SSE endpoint: http://{host}:{port}/sse", file=sys.stderr)
-        print(f"  Messages:      POST http://{host}:{port}/messages", file=sys.stderr)
-        print(f"  Health:        GET  http://{host}:{port}/health", file=sys.stderr)
-
-        import uvicorn
-        from starlette.applications import Starlette
-        from starlette.routing import Route
-        from starlette.responses import JSONResponse
-
-        async def health(request):
-            return JSONResponse({"status": "ok", "service": "laser-lidar mcp"})
-
-        app = mcp.sse_app()
-        app.router.routes.append(Route("/health", endpoint=health))
-
-        uvicorn.run(
-            app,
-            host=host,
-            port=port,
-            log_level="info",
-        )
+    import uvicorn
+    uvicorn.run(
+        "crop_height.mcp_server:app",
+        host=host,
+        port=port,
+        log_level="info",
+    )
 
 
 if __name__ == "__main__":

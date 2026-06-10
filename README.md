@@ -4,6 +4,8 @@
 
 根据农田 LiDAR 扫描的 LAS 点云，通过构建 DTM/DSM/CHM 确定作物株高。
 
+---
+
 ## 环境准备
 
 ```bash
@@ -13,8 +15,6 @@ source .venv/bin/activate
 
 ## 测试程序（快速验证处理效果）
 
-### 方法一：独立脚本（推荐）
-
 ```bash
 source .venv/bin/activate
 python run_analysis.py
@@ -22,11 +22,7 @@ python run_analysis.py
 
 自动扫描当前目录下所有 `.las` 文件，依次输出株高统计并生成可视化图 `<文件名>_analysis.png`。
 
-### 方法二：Python API
-
-```python
-source .venv/bin/activate
-```
+也可用 Python API：
 
 ```python
 from crop_height.pipeline import CropHeightAnalyzer
@@ -37,28 +33,36 @@ print(a.stats)
 
 ## 启动 MCP 服务器
 
-### SSE 模式（远程部署，给其他大模型用）
+### 生产部署（Streamable HTTP）
 
 ```bash
 source .venv/bin/activate
-
-# 默认端口 8080
-laser-lidar-mcp
-
-# 指定地址和端口
-laser-lidar-mcp --host 0.0.0.0 --port 8080
+uvicorn crop_height.mcp_server:app --host 0.0.0.0 --port 8000
 ```
 
-端点 | 说明
----|---
-`GET  /sse` | MCP SSE 连接端点
-`POST /messages` | MCP 消息端点
-`GET  /health` | 健康检查
+| 端点 | 说明 |
+|---|---|
+| `POST /mcp` | MCP Streamable HTTP 端点 |
+| `GET  /health` | 健康检查 |
 
-### stdio 模式（本地调试）
+### 本地调试（stdio）
 
 ```bash
-laser-lidar-mcp --transport stdio
+source .venv/bin/activate
+laser-lidar-mcp
+```
+
+### Inspector 调试
+
+```bash
+# 启动服务
+uvicorn crop_height.mcp_server:app --host 0.0.0.0 --port 8000
+
+# 另一个终端启动 Inspector
+npx @modelcontextprotocol/inspector
+# → Transport: Streamable HTTP
+# → URL: http://localhost:8000/mcp
+# → Click Connect → Tools → List Tools
 ```
 
 ## 项目结构
@@ -74,5 +78,5 @@ crop_height/         # 核心处理包
   rgb_analysis.py    # RGB 颜色与植被覆盖度
   export.py          # GeoTIFF 导出
   visualize.py       # 结果可视化
-  mcp_server.py      # MCP 服务器
+  mcp_server.py      # MCP 服务器 (FastMCP + Streamable HTTP)
 ```

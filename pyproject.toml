@@ -10,7 +10,8 @@ dependencies = [
     "matplotlib>=3.10",   # 可视化绘图
     "rasterio>=1.5",      # GeoTIFF 导出
     "pyproj>=3.7",        # 坐标参考系解析
-    "mcp>=1.0",           # MCP 服务器框架
+    "fastmcp>=3.4",       # MCP 服务器框架 (FastMCP)
+    "uvicorn>=0.49",      # ASGI 服务器
     "scikit-learn>=1.9",  # 机器学习工具
     "pandas>=3.0",        # 数据处理
 ]
@@ -22,7 +23,7 @@ viz = [
 ]
 
 [project.scripts]
-# CLI 入口: 启动 MCP 服务器 (SSE 或 stdio)
+# CLI 入口 (备用，主要用 uvicorn)
 laser-lidar-mcp = "crop_height.mcp_server:main"
 
 [build-system]
@@ -31,7 +32,3 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["crop_height*"]
-
-[tool.mcp]
-# mcp run mcp_server.py 的配置
-description = "作物株高分析 — 处理农田 LiDAR 点云，自动测量作物高度"
