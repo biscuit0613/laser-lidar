@@ -21,9 +21,17 @@ viz = [
     "open3d>=0.19",       # 点云处理与渲染
 ]
 
+[project.scripts]
+# CLI 入口: 启动 MCP 服务器 (SSE 或 stdio)
+laser-lidar-mcp = "crop_height.mcp_server:main"
+
 [build-system]
 requires = ["setuptools>=82"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["crop_height*"]
+
+[tool.mcp]
+# mcp run mcp_server.py 的配置
+description = "作物株高分析 — 处理农田 LiDAR 点云，自动测量作物高度"

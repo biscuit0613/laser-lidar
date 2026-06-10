@@ -1,0 +1,59 @@
+@startuml
+skinparam backgroundColor #fafbfc
+skinparam sequenceMessageAlign center
+
+actor "用户" as User
+participant "大模型客户端\n(Claude / Cursor 等)" as LLM
+participant "MCP 协议\n(SSE)" as MCP
+participant "laser-lidar 服务\n(uvicorn)" as Server
+database "点云文件\n(.las)" as LAS
+
+== 1. 服务注册 ==
+
+User -> LLM: 配置 MCP 服务器地址
+note over LLM: 在客户端配置中添加\nmcpServers.laser-lidar
+
+LLM -> MCP: GET /sse (建立 SSE 连接)
+MCP --> LLM: SSE 连接建立\n(事件流通道)
+
+LLM -> MCP: POST /messages\ninitialize (初始化)
+MCP -> Server: 传递协议请求
+Server --> MCP: server.info + 能力声明
+MCP --> LLM: 初始化完成
+
+LLM -> MCP: POST /messages\nlist_tools (发现工具)
+MCP -> Server: 传递 list_tools 请求
+Server --> MCP: 返回 4 个工具
+MCP --> LLM: tools 列表
+note right: get_las_info\nanalyze_crop_height\nbatch_compare\nexport_geotiff
+
+== 2. 用户提问 ==
+
+User -> LLM: "分析 las20230424_11.las 的作物高度"
+note over LLM: LLM 自主判断该调用哪个工具
+
+LLM -> MCP: POST /messages\ncall_tool("analyze_crop_height",\n  {file_path: "...", resolution: 0.25})
+MCP -> Server: 转发 tool call 请求
+
+Server -> LAS: 读取 LAS 文件
+LAS --> Server: 点云数据 (118k~389k 点)
+
+note over Server
+  1. 分离地面/植被点
+  2. 构建网格 (25cm)
+  3. DTM 插值
+  4. DSM 最大值
+  5. CHM = DSM - DTM
+  6. 统计 + 样方 + RGB
+end note
+
+Server --> MCP: CHM 统计结果 (JSON)
+MCP --> LLM: tool call 结果
+
+== 3. LLM 回复 ==
+
+note over LLM: LLM 看懂 JSON 结果，\n组织成自然语言回复
+
+LLM --> User: "分析完成:\n- 平均株高: 0.64m\n- 中位株高: 0.69m\n- 最高 10%: 0.80m\n- 植被覆盖度: 83.9%"
+
+@enduml
