@@ -1,0 +1,29 @@
+[project]
+name = "laser-lidar"
+version = "0.1.0"
+description = "农业激光雷达(LiDAR)点云处理 — 作物株高自动分析"
+requires-python = ">=3.12"
+dependencies = [
+    "laspy>=2.7",        # LAS 点云文件读写
+    "numpy>=2.4",         # 数值计算
+    "scipy>=1.17",        # 空间插值 (griddata)
+    "matplotlib>=3.10",   # 可视化绘图
+    "rasterio>=1.5",      # GeoTIFF 导出
+    "pyproj>=3.7",        # 坐标参考系解析
+    "mcp>=1.0",           # MCP 服务器框架
+    "scikit-learn>=1.9",  # 机器学习工具
+    "pandas>=3.0",        # 数据处理
+]
+
+[project.optional-dependencies]
+viz = [
+    "pyvista>=0.48",      # 3D 可视化
+    "open3d>=0.19",       # 点云处理与渲染
+]
+
+[build-system]
+requires = ["setuptools>=82"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["crop_height*"]
