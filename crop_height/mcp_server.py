@@ -24,12 +24,46 @@ from pathlib import Path
 from typing import Annotated
 
 from fastmcp import FastMCP
+
+# LAS 文件数据根目录。网页端传相对路径时会拼接此路径。
+# 可通过环境变量 LAS_DATA_DIR 配置，默认 None（使用传入的原始路径）。
+LAS_DATA_DIR = os.environ.get("LAS_DATA_DIR") or None
+
+
+def _resolve_path(file_path: str) -> Path:
+    """解析文件路径：如果 LAS_DATA_DIR 设置了且传入相对路径，则拼接"""
+    p = Path(file_path)
+    if p.is_absolute():
+        return p
+    if LAS_DATA_DIR:
+        return Path(LAS_DATA_DIR) / p
+    return p.resolve()
+
+
+def _run_analyzer(file_path: str, resolution: float):
+    """解析路径并运行分析器，返回 (path, analyzer) 或 (path, error_dict)"""
+    path = _resolve_path(file_path)
+    if not path.exists():
+        return None, {
+            "error": f"文件不存在: {file_path}",
+            "hint": "若配置了 LAS_DATA_DIR，文件应放在该目录下；否则请使用绝对路径。",
+        }
+    if resolution <= 0:
+        return None, {"error": "分辨率必须大于 0"}
+    try:
+        from .pipeline import CropHeightAnalyzer
+        analyzer = CropHeightAnalyzer(str(path), resolution=resolution)
+        analyzer.run()
+        return path, analyzer
+    except Exception as e:
+        return None, {"error": f"分析失败: {e}"}
+
+
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from .pipeline import CropHeightAnalyzer
 from .las_reader import get_las_info as get_las_file_info
 
 # ── MCP 服务器实例 ─────────────────────────────────────────────
@@ -57,14 +91,15 @@ async def health_check(request: Request) -> JSONResponse:
     ),
 )
 async def get_las_info(
-    file_path: Annotated[str, "LAS 点云文件的绝对路径或相对于工作目录的路径"],
+    file_path: Annotated[str, "LAS 点云文件路径。支持绝对路径；若配置了环境变量 LAS_DATA_DIR，也支持相对路径"],
 ) -> dict:
     """
     获取 LAS 文件的基础元数据信息。
     """
-    path = Path(file_path)
+    path = _resolve_path(file_path)
     if not path.exists():
-        return {"error": f"文件不存在: {file_path}"}
+        hint = f"若配置了 LAS_DATA_DIR，文件应放在该目录下；否则请使用绝对路径。"
+        return {"error": f"文件不存在: {file_path}", "hint": hint}
 
     try:
         info = get_las_file_info(str(path))
@@ -86,57 +121,137 @@ async def get_las_info(
     description=(
         "对单个 LAS 点云文件执行作物株高分析。自动分离地面点 (Class 2) "
         "与植被点 (Class 1)，构建冠层高度模型 (CHM)，返回株高统计指标 "
-        "(均值、中位数、P90、P95)、样方空间分布以及 RGB 植被指数。"
+        "(均值、中位数、P90、P95、Min、Max、Std) 及 CHM 像元数。"
+        "如需样方空间分布，请使用 analyze_quadrat 工具；"
+        "如需 RGB 植被指数，请使用 analyze_rgb 工具。"
     ),
 )
 async def analyze_crop_height(
-    file_path: Annotated[str, "LAS 点云文件的路径"],
+    file_path: Annotated[str, "LAS 点云文件路径。支持绝对路径；若配置了 LAS_DATA_DIR，也支持相对路径"],
     resolution: Annotated[float, "分析网格分辨率，单位米，值越小精度越高但计算量越大。推荐 0.25"] = 0.25,
 ) -> dict:
     """
-    对单个 LAS 文件执行作物株高分析。
+    对单个 LAS 文件执行作物株高分析，返回 CHM 统计指标。
     """
-    path = Path(file_path)
-    if not path.exists():
-        return {"error": f"文件不存在: {file_path}"}
-    if resolution <= 0:
-        return {"error": "分辨率必须大于 0"}
+    path, result = _run_analyzer(file_path, resolution)
+    if result is None:
+        return result
 
-    try:
-        analyzer = CropHeightAnalyzer(str(path), resolution=resolution)
-        analyzer.run()
-    except Exception as e:
-        return {"error": f"分析失败: {e}"}
-
-    # 组装基础结果
-    result = {
+    analyzer = result
+    stats = analyzer.stats
+    return {
         "file": str(path),
         "resolution": resolution,
         "point_count": analyzer.info.point_count,
         "classification": dict(analyzer.info.classifications),
-        "chm_statistics": analyzer.stats,
+        "chm_statistics": {
+            "count": stats.get("count"),
+            "min": stats.get("min"),
+            "max": stats.get("max"),
+            "mean": stats.get("mean"),
+            "median": stats.get("median"),
+            "std": stats.get("std"),
+            "p25": stats.get("p25"),
+            "p75": stats.get("p75"),
+            "p90": stats.get("p90"),
+            "p95": stats.get("p95"),
+        },
     }
 
-    # 样方分析 (0.5m × 0.5m 区块)
-    quadrats = analyzer.quadrat(block_size=2)
-    if quadrats:
-        result["quadrat_analysis"] = {
-            "block_size_cells": 2,
-            "block_size_meters": round(resolution * 2, 2),
-            "blocks": quadrats,
-            "summary": {
-                "total_blocks": len(quadrats),
-                "mean_range": {
-                    "min": round(min(q["mean"] for q in quadrats), 4),
-                    "max": round(max(q["mean"] for q in quadrats), 4),
-                },
-            },
+
+# ── Tool: 样方空间分布分析 ────────────────────────────────────
+@mcp.tool(
+    description=(
+        "对 LAS 点云文件进行样方 (quadrat) 空间分布分析。将 CHM 网格划分为 "
+        "等大区块，返回每个区块内的株高均值、中位数、最大值、P90，"
+        "用于发现田块内部的空间变异。需要对同一文件先调用 analyze_crop_height。"
+    ),
+)
+async def analyze_quadrat(
+    file_path: Annotated[str, "LAS 点云文件路径。支持绝对路径；若配置了 LAS_DATA_DIR，也支持相对路径"],
+    resolution: Annotated[float, "分析网格分辨率，单位米，推荐 0.25"] = 0.25,
+    block_size: Annotated[int, "每个样方包含的网格数，默认 2（即 0.5×0.5m 区块）"] = 2,
+) -> dict:
+    """
+    对 LAS 文件进行样方空间分布分析。
+    """
+    path, result = _run_analyzer(file_path, resolution)
+    if result is None:
+        return result
+
+    analyzer = result
+    quadrats = analyzer.quadrat(block_size=block_size)
+    if not quadrats:
+        return {
+            "file": str(path),
+            "resolution": resolution,
+            "block_size_cells": block_size,
+            "block_size_meters": round(resolution * block_size, 2),
+            "blocks": [],
+            "summary": {"total_blocks": 0},
         }
 
-    # RGB 颜色分析
-    result["rgb_analysis"] = analyzer.rgb_analysis()
+    return {
+        "file": str(path),
+        "resolution": resolution,
+        "block_size_cells": block_size,
+        "block_size_meters": round(resolution * block_size, 2),
+        "blocks": quadrats,
+        "summary": {
+            "total_blocks": len(quadrats),
+            "mean_range": {
+                "min": round(min(q["mean"] for q in quadrats), 4),
+                "max": round(max(q["mean"] for q in quadrats), 4),
+            },
+            "median_mean": round(
+                sum(q["mean"] for q in quadrats) / len(quadrats), 4
+            ),
+        },
+    }
 
-    return result
+
+# ── Tool: RGB 植被指数分析 ────────────────────────────────────
+@mcp.tool(
+    description=(
+        "对 LAS 点云文件进行 RGB 颜色分析，估算植被覆盖度和绿色指数。"
+        "返回绿光占比 (Green Ratio)、基于绿光阈值的植被覆盖度、"
+        "以及过绿指数 (ExG) 的均值和标准差。"
+        "仅对包含 RGB 颜色信息的点云文件有效。"
+    ),
+)
+async def analyze_rgb(
+    file_path: Annotated[str, "LAS 点云文件路径。支持绝对路径；若配置了 LAS_DATA_DIR，也支持相对路径"],
+    resolution: Annotated[float, "分析网格分辨率，单位米，推荐 0.25"] = 0.25,
+    green_threshold: Annotated[float, "绿光占比阈值，用于判定植被点，默认 0.35"] = 0.35,
+) -> dict:
+    """
+    对 LAS 文件进行 RGB 植被指数分析。
+    """
+    path, result = _run_analyzer(file_path, resolution)
+    if result is None:
+        return result
+
+    analyzer = result
+    if analyzer.rgb is None:
+        return {
+            "file": str(path),
+            "has_rgb": False,
+            "message": "该 LAS 文件不包含 RGB 颜色信息，无法进行颜色分析。",
+        }
+
+    base = analyzer.rgb_analysis()
+
+    from .rgb_analysis import vegetation_cover, excess_green
+    veg_custom = vegetation_cover(analyzer.rgb, g_threshold=green_threshold)
+    exg = excess_green(analyzer.rgb)
+
+    return {
+        "file": str(path),
+        "has_rgb": True,
+        "green_ratio": base["green_ratio"],
+        "vegetation_cover": veg_custom,
+        "excess_green": exg,
+    }
 
 
 # ── Tool: 多文件批量比较 ──────────────────────────────────────
@@ -159,31 +274,27 @@ async def batch_compare(
     results = []
     errors = []
     for fp in file_paths:
-        path = Path(fp)
-        if not path.exists():
-            errors.append({"file": fp, "error": "文件不存在"})
+        path, analyzer_or_error = _run_analyzer(fp, resolution)
+        if path is None:
+            errors.append({"file": fp, "error": analyzer_or_error.get("error", "未知错误")})
             continue
 
-        try:
-            analyzer = CropHeightAnalyzer(str(path), resolution=resolution)
-            analyzer.run()
-            stats = analyzer.stats
-            results.append({
-                "file": str(path),
-                "point_count": analyzer.info.point_count,
-                "ground_points": len(analyzer.ground_pts),
-                "vegetation_points": len(analyzer.veg_pts),
-                "chm_cells": stats.get("count", 0),
-                "mean_height": stats.get("mean"),
-                "median_height": stats.get("median"),
-                "p90_height": stats.get("p90"),
-                "p95_height": stats.get("p95"),
-                "min_height": stats.get("min"),
-                "max_height": stats.get("max"),
-                "std_height": stats.get("std"),
-            })
-        except Exception as e:
-            errors.append({"file": fp, "error": str(e)})
+        analyzer = analyzer_or_error
+        stats = analyzer.stats
+        results.append({
+            "file": str(path),
+            "point_count": analyzer.info.point_count,
+            "ground_points": len(analyzer.ground_pts),
+            "vegetation_points": len(analyzer.veg_pts),
+            "chm_cells": stats.get("count", 0),
+            "mean_height": stats.get("mean"),
+            "median_height": stats.get("median"),
+            "p90_height": stats.get("p90"),
+            "p95_height": stats.get("p95"),
+            "min_height": stats.get("min"),
+            "max_height": stats.get("max"),
+            "std_height": stats.get("std"),
+        })
 
     return {
         "files_analyzed": len(results),
@@ -202,22 +313,24 @@ async def batch_compare(
     ),
 )
 async def export_geotiff(
-    file_path: Annotated[str, "输入的 LAS 点云文件路径"],
+    file_path: Annotated[str, "输入的 LAS 点云文件路径。支持绝对路径；若配置了 LAS_DATA_DIR，也支持相对路径"],
     output_path: Annotated[str, "输出的 .tif 文件绝对路径"],
     resolution: Annotated[float, "分析网格分辨率，单位米，默认 0.25"] = 0.25,
 ) -> dict:
     """
     将分析生成的 CHM 导出为 GeoTIFF 栅格文件。
     """
-    path = Path(file_path)
+    path = _resolve_path(file_path)
     if not path.exists():
-        return {"error": f"输入文件不存在: {file_path}"}
+        hint = f"若配置了 LAS_DATA_DIR，文件应放在该目录下；否则请使用绝对路径。"
+        return {"error": f"输入文件不存在: {file_path}", "hint": hint}
 
     out = Path(output_path)
     if out.is_dir():
         return {"error": f"输出路径是一个目录: {output_path}"}
 
     try:
+        from .pipeline import CropHeightAnalyzer
         analyzer = CropHeightAnalyzer(str(path), resolution=resolution)
         analyzer.run()
         result = analyzer.export_geotiff(str(out))
