@@ -40,6 +40,13 @@ def _resolve_path(file_path: str) -> Path:
     return p.resolve()
 
 
+def _cm(val: float | None) -> float | None:
+    """米转厘米，保留 2 位小数"""
+    if val is None:
+        return None
+    return round(val * 100, 2)
+
+
 def _run_analyzer(file_path: str, resolution: float):
     """解析路径并运行分析器，返回 (path, analyzer) 或 (path, error_dict)"""
     path = _resolve_path(file_path)
@@ -121,17 +128,17 @@ async def get_las_info(
     description=(
         "对单个 LAS 点云文件执行作物株高分析。自动分离地面点 (Class 2) "
         "与植被点 (Class 1)，构建冠层高度模型 (CHM)，返回株高统计指标 "
-        "(均值、中位数、P90、P95、Min、Max、Std) 及 CHM 像元数。"
+        "(均值、中位数、P90、P95、Min、Max、Std，单位均为厘米) 及 CHM 像元数。"
         "如需样方空间分布，请使用 analyze_quadrat 工具；"
         "如需 RGB 植被指数，请使用 analyze_rgb 工具。"
     ),
 )
 async def analyze_crop_height(
-    file_path: Annotated[str, "LAS 点云文件路径。支持绝对路径；若配置了 LAS_DATA_DIR，也支持相对路径"],
+    file_path: Annotated[str, "LAS 点云文件路径。支持绝对路径；若配置了环境变量 LAS_DATA_DIR，也支持相对路径"],
     resolution: Annotated[float, "分析网格分辨率，单位米，值越小精度越高但计算量越大。推荐 0.25"] = 0.25,
 ) -> dict:
     """
-    对单个 LAS 文件执行作物株高分析，返回 CHM 统计指标。
+    对单个 LAS 文件执行作物株高分析，返回 CHM 统计指标（单位厘米）。
     """
     path, result = _run_analyzer(file_path, resolution)
     if result is None:
@@ -146,15 +153,15 @@ async def analyze_crop_height(
         "classification": dict(analyzer.info.classifications),
         "chm_statistics": {
             "count": stats.get("count"),
-            "min": stats.get("min"),
-            "max": stats.get("max"),
-            "mean": stats.get("mean"),
-            "median": stats.get("median"),
-            "std": stats.get("std"),
-            "p25": stats.get("p25"),
-            "p75": stats.get("p75"),
-            "p90": stats.get("p90"),
-            "p95": stats.get("p95"),
+            "min": _cm(stats.get("min")),
+            "max": _cm(stats.get("max")),
+            "mean": _cm(stats.get("mean")),
+            "median": _cm(stats.get("median")),
+            "std": _cm(stats.get("std")),
+            "p25": _cm(stats.get("p25")),
+            "p75": _cm(stats.get("p75")),
+            "p90": _cm(stats.get("p90")),
+            "p95": _cm(stats.get("p95")),
         },
     }
 
@@ -163,8 +170,8 @@ async def analyze_crop_height(
 @mcp.tool(
     description=(
         "对 LAS 点云文件进行样方 (quadrat) 空间分布分析。将 CHM 网格划分为 "
-        "等大区块，返回每个区块内的株高均值、中位数、最大值、P90，"
-        "用于发现田块内部的空间变异。需要对同一文件先调用 analyze_crop_height。"
+        "等大区块，返回每个区块内的株高均值、中位数、最大值、P90（单位均为厘米），"
+        "用于发现田块内部的空间变异。"
     ),
 )
 async def analyze_quadrat(
@@ -173,7 +180,7 @@ async def analyze_quadrat(
     block_size: Annotated[int, "每个样方包含的网格数，默认 2（即 0.5×0.5m 区块）"] = 2,
 ) -> dict:
     """
-    对 LAS 文件进行样方空间分布分析。
+    对 LAS 文件进行样方空间分布分析，返回株高值（单位厘米）。
     """
     path, result = _run_analyzer(file_path, resolution)
     if result is None:
@@ -191,21 +198,34 @@ async def analyze_quadrat(
             "summary": {"total_blocks": 0},
         }
 
+    blocks_cm = []
+    for q in quadrats:
+        blocks_cm.append({
+            "row": q["row"],
+            "col": q["col"],
+            "x_center": q["x_center"],
+            "y_center": q["y_center"],
+            "count": q["count"],
+            "mean": _cm(q["mean"]),
+            "median": _cm(q["median"]),
+            "max": _cm(q["max"]),
+            "p90": _cm(q["p90"]),
+        })
+
+    means = [q["mean"] for q in quadrats]
     return {
         "file": str(path),
         "resolution": resolution,
         "block_size_cells": block_size,
         "block_size_meters": round(resolution * block_size, 2),
-        "blocks": quadrats,
+        "blocks": blocks_cm,
         "summary": {
             "total_blocks": len(quadrats),
             "mean_range": {
-                "min": round(min(q["mean"] for q in quadrats), 4),
-                "max": round(max(q["mean"] for q in quadrats), 4),
+                "min": _cm(min(means)),
+                "max": _cm(max(means)),
             },
-            "median_mean": round(
-                sum(q["mean"] for q in quadrats) / len(quadrats), 4
-            ),
+            "median_mean": _cm(sum(means) / len(means)),
         },
     }
 
@@ -258,7 +278,8 @@ async def analyze_rgb(
 @mcp.tool(
     description=(
         "批量比较多个 LAS 文件的株高统计结果。适用于对比不同地块、"
-        "不同处理或不同时相的作物长势。返回每个文件的均值、中位数、P90、P95 等对比表。"
+        "不同处理或不同时相的作物长势。返回每个文件的均值、中位数、P90、P95"
+        "等指标，单位均为厘米。"
     ),
 )
 async def batch_compare(
@@ -266,7 +287,7 @@ async def batch_compare(
     resolution: Annotated[float, "分析网格分辨率，单位米，默认 0.25"] = 0.25,
 ) -> dict:
     """
-    批量比较多个 LAS 文件的株高统计结果。
+    批量比较多个 LAS 文件的株高统计结果（单位厘米）。
     """
     if not file_paths:
         return {"error": "未提供文件路径"}
@@ -287,13 +308,13 @@ async def batch_compare(
             "ground_points": len(analyzer.ground_pts),
             "vegetation_points": len(analyzer.veg_pts),
             "chm_cells": stats.get("count", 0),
-            "mean_height": stats.get("mean"),
-            "median_height": stats.get("median"),
-            "p90_height": stats.get("p90"),
-            "p95_height": stats.get("p95"),
-            "min_height": stats.get("min"),
-            "max_height": stats.get("max"),
-            "std_height": stats.get("std"),
+            "mean_height": _cm(stats.get("mean")),
+            "median_height": _cm(stats.get("median")),
+            "p90_height": _cm(stats.get("p90")),
+            "p95_height": _cm(stats.get("p95")),
+            "min_height": _cm(stats.get("min")),
+            "max_height": _cm(stats.get("max")),
+            "std_height": _cm(stats.get("std")),
         })
 
     return {
